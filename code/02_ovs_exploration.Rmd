@@ -1,0 +1,468 @@
+---
+title: "PhillyStat360 - OVS Exploratory Analysis & Parcel Drill-Down"
+author: "MUSA Practicum Team"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Setup
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(knitr)
+library(scales)
+library(patchwork)
+
+data_path <- "../rawdata/"
+```
+
+## 1. Load Data
+
+```{r read-data, cache=TRUE}
+# Primary table: all Philadelphia parcels
+properties <- read_csv(paste0(data_path, "opa_properties_public.csv"),
+                       show_col_types = FALSE) %>% clean_names()
+
+# Three core OVS sources
+clean_seal <- read_csv(paste0(data_path, "clean_seal.csv"),
+                       show_col_types = FALSE) %>% clean_names()
+
+violations <- read_csv(paste0(data_path, "violations.csv"),
+                       show_col_types = FALSE) %>% clean_names()
+
+licenses <- read_csv(paste0(data_path, "business_licenses.csv"),
+                     show_col_types = FALSE) %>% clean_names()
+
+# Supplementary tables
+unsafe <- read_csv(paste0(data_path, "unsafe.csv"),
+                   show_col_types = FALSE) %>% clean_names()
+
+imm_dang <- read_csv(paste0(data_path, "imm_dang.csv"),
+                     show_col_types = FALSE) %>% clean_names()
+
+cat("properties:", comma(nrow(properties)), "rows\n")
+cat("clean_seal:", comma(nrow(clean_seal)), "rows\n")
+cat("violations:", comma(nrow(violations)), "rows\n")
+cat("licenses:", comma(nrow(licenses)), "rows\n")
+cat("unsafe:", comma(nrow(unsafe)), "rows\n")
+cat("imm_dang:", comma(nrow(imm_dang)), "rows\n")
+```
+
+## 2. Constructing the Observed Vacancy Status (OVS)
+
+Based on the VacancyGuide2026 methodology and client kickoff meeting, a parcel is classified as OVS=1 (observed vacant) if it meets **any** of the following criteria:
+
+- **Source 1: Clean & Seal** — Property appears in the L+I Clean & Seal records (government-sealed dangerous building)
+- **Source 2: Vacant Violations** — Property has specific vacancy-related violation codes with status = 'OPEN'
+- **Source 3: Vacant License** — Property holds an active Vacant Property license
+
+### 2a. Source 1: Clean & Seal Parcels
+
+```{r ovs-cleanseal}
+cs_parcels <- clean_seal %>%
+  filter(!is.na(opa_account_num)) %>%
+  distinct(opa_account_num) %>%
+  mutate(ovs_clean_seal = 1)
+
+cat("Distinct parcels in Clean & Seal:", comma(nrow(cs_parcels)), "\n")
+```
+
+### 2b. Source 2: Vacant Violations (Currently OPEN)
+
+Per VacancyGuide, only violations with `violationstatus = 'OPEN'` are considered.
+
+```{r ovs-violations}
+# Vacancy-related violation codes per VacancyGuide2026
+vacant_viol_codes <- c(
+  "9-3904",     # Vacant Lot License
+  "9-3905",     # Vacant Structure License
+  "PM15-901.1", # Vacant & Open Properties
+  "PM15-901.2", # Vacant Properties - Blighted Condition
+  "PM15-301",   # Vacant Structure & Land
+  "CP-102",     # License - Vacant Lot
+  "CP-103",     # License - Vacant Building
+  "PM-102.4/1", # License - Vac Lot
+  "PM-102.4/2", # License - Vac Res Bldg
+  "PM-102.4/3", # License - Vac Wharf/Pier
+  "PM-102.4/4"  # License - Vac Comm Bldg
+)
+
+viol_parcels <- violations %>%
+  filter(violationcode %in% vacant_viol_codes,
+         tolower(violationstatus) == "open") %>%
+  distinct(opa_account_num) %>%
+  filter(!is.na(opa_account_num)) %>%
+  mutate(ovs_violation = 1)
+
+cat("Distinct parcels with OPEN vacant violations:", comma(nrow(viol_parcels)), "\n")
+
+# Distribution of OPEN vacant violation codes
+violations %>%
+  filter(violationcode %in% vacant_viol_codes,
+         tolower(violationstatus) == "open") %>%
+  count(violationcode, sort = TRUE) %>%
+  kable(caption = "Distribution of Currently OPEN Vacant Violation Codes")
+```
+
+### 2c. Source 3: Active Vacant License
+
+```{r ovs-license}
+# Per VacancyGuide: licensestatus = 'Active' AND revenuecode IN ('3219', '3634')
+# 3219 = Residential Vacant License, 3634 = Vacant Commercial Property
+vacant_license_parcels <- licenses %>%
+  filter(tolower(licensestatus) == "active",
+         revenuecode %in% c("3219", "3634")) %>%
+  distinct(opa_account_num) %>%
+  filter(!is.na(opa_account_num)) %>%
+  mutate(ovs_license = 1)
+
+cat("Distinct parcels with Active Vacant License:", comma(nrow(vacant_license_parcels)), "\n")
+```
+
+### 2d. Merging OVS onto Properties
+
+```{r ovs-merge}
+ovs_df <- properties %>%
+  select(parcel_number, location, owner_1, category_code, category_code_description,
+         year_built, total_livable_area, market_value, sale_date, sale_price,
+         exterior_condition, zoning, zip_code, census_tract) %>%
+  left_join(cs_parcels, by = c("parcel_number" = "opa_account_num")) %>%
+  left_join(viol_parcels, by = c("parcel_number" = "opa_account_num")) %>%
+  left_join(vacant_license_parcels, by = c("parcel_number" = "opa_account_num")) %>%
+  replace_na(list(ovs_clean_seal = 0, ovs_violation = 0, ovs_license = 0)) %>%
+  mutate(
+    ovs = if_else(ovs_clean_seal == 1 | ovs_violation == 1 | ovs_license == 1, 1, 0),
+    ovs_sources = ovs_clean_seal + ovs_violation + ovs_license
+  )
+
+cat("Total parcels:", comma(nrow(ovs_df)), "\n")
+cat("OVS=1 (Observed Vacant):", comma(sum(ovs_df$ovs == 1)), "\n")
+cat("OVS=0:", comma(sum(ovs_df$ovs == 0)), "\n")
+cat("Vacancy rate:", percent(mean(ovs_df$ovs), accuracy = 0.1), "\n")
+```
+
+## 3. Exploratory Analysis Around OVS
+
+### 3a. OVS Source Overlap
+
+How much do the three sources agree? Are parcels typically flagged by one source or multiple?
+
+```{r ovs-overlap}
+ovs_positive <- ovs_df %>% filter(ovs == 1)
+
+cat("=== OVS=1 Source Breakdown ===\n")
+cat("Clean & Seal only:", comma(sum(ovs_positive$ovs_clean_seal == 1 & ovs_positive$ovs_violation == 0 & ovs_positive$ovs_license == 0)), "\n")
+cat("Violation only:", comma(sum(ovs_positive$ovs_clean_seal == 0 & ovs_positive$ovs_violation == 1 & ovs_positive$ovs_license == 0)), "\n")
+cat("License only:", comma(sum(ovs_positive$ovs_clean_seal == 0 & ovs_positive$ovs_violation == 0 & ovs_positive$ovs_license == 1)), "\n")
+cat("Two sources overlap:", comma(sum(ovs_positive$ovs_sources == 2)), "\n")
+cat("All three sources:", comma(sum(ovs_positive$ovs_sources == 3)), "\n")
+```
+
+```{r ovs-overlap-plot, fig.width=8, fig.height=5}
+ovs_positive %>%
+  mutate(source_combo = case_when(
+    ovs_clean_seal == 1 & ovs_violation == 1 & ovs_license == 1 ~ "All Three",
+    ovs_clean_seal == 1 & ovs_violation == 1 ~ "Clean&Seal + Violation",
+    ovs_clean_seal == 1 & ovs_license == 1 ~ "Clean&Seal + License",
+    ovs_violation == 1 & ovs_license == 1 ~ "Violation + License",
+    ovs_clean_seal == 1 ~ "Clean & Seal Only",
+    ovs_violation == 1 ~ "Violation Only",
+    ovs_license == 1 ~ "License Only"
+  )) %>%
+  count(source_combo, sort = TRUE) %>%
+  ggplot(aes(x = reorder(source_combo, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "OVS=1 Parcels by Source Combination",
+       x = NULL, y = "Number of Parcels") +
+  theme_minimal() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)))
+```
+
+### 3b. OVS vs. Property Characteristics
+
+```{r ovs-features, fig.width=10, fig.height=8}
+# Market Value comparison (log scale due to extreme skew)
+p1 <- ovs_df %>%
+  filter(market_value > 0) %>%
+  ggplot(aes(x = factor(ovs, labels = c("Not Vacant", "Vacant")),
+             y = market_value)) +
+  geom_boxplot(fill = c("gray80", "tomato"), outlier.alpha = 0.05) +
+  scale_y_log10(labels = dollar) +
+  labs(title = "Market Value by OVS", x = NULL, y = "Market Value (log scale)") +
+  theme_minimal()
+
+# Year Built comparison
+p2 <- ovs_df %>%
+  filter(!is.na(year_built), year_built > 1700) %>%
+  ggplot(aes(x = year_built, fill = factor(ovs, labels = c("Not Vacant", "Vacant")))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Year Built Distribution by OVS",
+       x = "Year Built", y = "Density", fill = NULL) +
+  theme_minimal()
+
+# Exterior Condition comparison
+p3 <- ovs_df %>%
+  filter(!is.na(exterior_condition)) %>%
+  count(ovs, exterior_condition) %>%
+  group_by(ovs) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = factor(exterior_condition), y = pct,
+             fill = factor(ovs, labels = c("Not Vacant", "Vacant")))) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Exterior Condition Distribution by OVS",
+       subtitle = "1 = Best, 7 = Worst",
+       x = "Exterior Condition", y = "Proportion", fill = NULL) +
+  theme_minimal()
+
+# OPA Category Code = 6 (Vacant Land) rate
+p4 <- ovs_df %>%
+  mutate(is_vacant_land = category_code == "6") %>%
+  count(ovs, is_vacant_land) %>%
+  group_by(ovs) %>%
+  mutate(pct = n / sum(n)) %>%
+  filter(is_vacant_land == TRUE) %>%
+  ggplot(aes(x = factor(ovs, labels = c("Not Vacant", "Vacant")), y = pct)) +
+  geom_col(fill = c("gray60", "tomato"), width = 0.5) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "OPA Category Code = 6 (Vacant Land) Rate",
+       x = NULL, y = "% with Vacant Land Code") +
+  theme_minimal()
+
+(p1 | p2) / (p3 | p4)
+```
+
+### 3c. Spatial Distribution of Vacancy (by Zip Code)
+
+```{r ovs-spatial, fig.width=10, fig.height=6}
+zip_summary <- ovs_df %>%
+  filter(!is.na(zip_code)) %>%
+  group_by(zip_code) %>%
+  summarise(
+    total = n(),
+    vacant = sum(ovs),
+    vacancy_rate = mean(ovs),
+    .groups = "drop"
+  ) %>%
+  filter(total >= 100) %>%
+  arrange(desc(vacancy_rate))
+
+zip_summary %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(as.character(zip_code), vacancy_rate), y = vacancy_rate)) +
+  geom_col(fill = "tomato") +
+  geom_text(aes(label = paste0(round(vacancy_rate * 100, 1), "%")),
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Top 20 Zip Codes by Vacancy Rate",
+       subtitle = "Only zip codes with 100+ parcels",
+       x = "Zip Code", y = "Vacancy Rate") +
+  theme_minimal()
+```
+
+### 3d. Summary Statistics
+
+```{r ovs-summary}
+ovs_df %>%
+  group_by(OVS = factor(ovs, labels = c("Not Vacant (0)", "Vacant (1)"))) %>%
+  summarise(
+    Count = comma(n()),
+    Avg_Market_Value = dollar(mean(market_value, na.rm = TRUE)),
+    Median_Market_Value = dollar(median(market_value, na.rm = TRUE)),
+    Avg_Year_Built = round(mean(year_built, na.rm = TRUE), 0),
+    Avg_Livable_Area = comma(round(mean(total_livable_area, na.rm = TRUE), 0)),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "Feature Comparison: OVS=0 vs OVS=1")
+```
+
+## 4. Parcel Drill-Down
+
+We select 2-3 specific parcels representing different vacancy profiles and trace their records across all available datasets to understand how vacancy manifests in the data.
+
+### Helper Function
+
+```{r drilldown-function}
+drill_down <- function(parcel_id) {
+  cat("\n========================================\n")
+  cat("PARCEL:", parcel_id, "\n")
+  cat("========================================\n")
+
+  # --- OPA Properties ---
+  prop <- properties %>% filter(parcel_number == parcel_id)
+  if (nrow(prop) > 0) {
+    cat("\n--- OPA Properties ---\n")
+    cat("Address:", prop$location[1], "\n")
+    cat("Owner:", prop$owner_1[1], "\n")
+    cat("Category:", prop$category_code[1], "-", prop$category_code_description[1], "\n")
+    cat("Year Built:", prop$year_built[1], "\n")
+    cat("Livable Area:", prop$total_livable_area[1], "sqft\n")
+    cat("Market Value: $", comma(prop$market_value[1]), "\n")
+    cat("Last Sale:", as.character(prop$sale_date[1]), "  Price: $", comma(prop$sale_price[1]), "\n")
+    cat("Exterior Condition:", prop$exterior_condition[1], "(1=Best, 7=Worst)\n")
+    cat("Zoning:", prop$zoning[1], "\n")
+  } else {
+    cat("Not found in OPA Properties table\n")
+  }
+
+  # --- Clean & Seal ---
+  cs <- clean_seal %>% filter(opa_account_num == parcel_id)
+  cat("\n--- Clean & Seal Records (", nrow(cs), ") ---\n")
+  if (nrow(cs) > 0) {
+    cs %>%
+      select(casecreateddate, workordertype, workorderstatus, casecompleteddate) %>%
+      arrange(casecreateddate) %>%
+      print()
+  }
+
+  # --- Violations ---
+  viol <- violations %>% filter(opa_account_num == parcel_id)
+  cat("\n--- Violation Records (", nrow(viol), ") ---\n")
+  if (nrow(viol) > 0) {
+    viol %>%
+      select(violationdate, violationcode, violationcodetitle,
+             violationstatus, mostrecentinvestigation) %>%
+      arrange(violationdate) %>%
+      print(n = 30)
+  }
+
+  # --- Business Licenses ---
+  lic <- licenses %>% filter(opa_account_num == parcel_id)
+  cat("\n--- Business License Records (", nrow(lic), ") ---\n")
+  if (nrow(lic) > 0) {
+    lic %>%
+      select(licensetype, licensestatus, revenuecode,
+             initialissuedate, expirationdate) %>%
+      arrange(initialissuedate) %>%
+      print()
+  }
+
+  # --- Unsafe ---
+  uns <- unsafe %>% filter(opa_account_num == parcel_id)
+  cat("\n--- Unsafe Structure Records (", nrow(uns), ") ---\n")
+  if (nrow(uns) > 0) {
+    uns %>%
+      select(violationdate, violationcode, violationcodetitle) %>%
+      arrange(violationdate) %>%
+      print()
+  }
+
+  # --- Imminently Dangerous ---
+  imd <- imm_dang %>% filter(opa_account_num == parcel_id)
+  cat("\n--- Imminently Dangerous Records (", nrow(imd), ") ---\n")
+  if (nrow(imd) > 0) {
+    imd %>%
+      select(violationdate, violationcode, violationcodetitle) %>%
+      arrange(violationdate) %>%
+      print()
+  }
+}
+```
+
+### 4a. Selecting Target Parcels
+
+We select three cases representing distinct vacancy profiles:
+
+- **Case 1: Severe vacancy** — flagged by all three OVS sources and also in the unsafe structures table
+- **Case 2: Violation-only** — flagged only through open violations, no clean & seal or license record
+- **Case 3: Potential false negative** — OVS=0 but OPA category_code = '6' (Vacant Land)
+
+```{r select-parcels}
+# Case 1: Severe vacancy — all three OVS sources + unsafe
+case1_candidates <- ovs_df %>%
+  filter(ovs_sources == 3) %>%
+  filter(parcel_number %in% unsafe$opa_account_num) %>%
+  arrange(market_value) %>%
+  head(5)
+
+cat("=== Case 1 Candidates (All 3 sources + Unsafe) ===\n")
+case1_candidates %>%
+  select(parcel_number, location, market_value, exterior_condition, year_built) %>%
+  kable()
+
+# Case 2: Violation-only (no clean & seal, no license)
+case2_candidates <- ovs_df %>%
+  filter(ovs_violation == 1, ovs_clean_seal == 0, ovs_license == 0) %>%
+  filter(!is.na(exterior_condition)) %>%
+  arrange(desc(market_value)) %>%
+  head(5)
+
+cat("\n=== Case 2 Candidates (Violation only, high market value) ===\n")
+case2_candidates %>%
+  select(parcel_number, location, market_value, exterior_condition, year_built) %>%
+  kable()
+
+# Case 3: Potential false negative — OVS=0 but OPA marks as Vacant Land
+set.seed(42)
+case3_candidates <- ovs_df %>%
+  filter(ovs == 0, category_code == "6") %>%
+  filter(market_value > 0) %>%
+  sample_n(min(5, n()))
+
+cat("\n=== Case 3 Candidates (OVS=0 but OPA Vacant Land) ===\n")
+case3_candidates %>%
+  select(parcel_number, location, market_value, category_code_description) %>%
+  kable()
+```
+
+### 4b. Drill-Down Results
+
+#### Case 1: Severe Vacancy
+
+```{r drilldown-case1}
+if (nrow(case1_candidates) > 0) {
+  drill_down(case1_candidates$parcel_number[1])
+}
+```
+
+#### Case 2: Violation-Only
+
+```{r drilldown-case2}
+if (nrow(case2_candidates) > 0) {
+  drill_down(case2_candidates$parcel_number[1])
+}
+```
+
+#### Case 3: Potential False Negative
+
+```{r drilldown-case3}
+if (nrow(case3_candidates) > 0) {
+  drill_down(case3_candidates$parcel_number[1])
+}
+```
+
+## 5. Preliminary Findings
+
+### OVS Overview
+
+- **Overall vacancy rate: ~8.3%** (48,671 out of 583,802 parcels)
+- Clean & Seal is the dominant source, contributing ~88% of all OVS=1 parcels on its own
+- Violation and License sources have limited independent coverage (1,738 and 920 parcels respectively)
+- Very few parcels are flagged by all three sources (98), suggesting the sources capture different aspects of vacancy
+
+### Feature Differences
+
+- Vacant parcels have significantly lower market values (median $145,600 vs $221,800)
+- Exterior condition shows a clear shift: vacant parcels are disproportionately rated 4-7 (poor to worst)
+- A much higher proportion of OVS=1 parcels carry OPA Vacant Land codes (category_code = '6')
+
+### Drill-Down Insights
+
+- **Case 1** (severe vacancy) illustrates a typical deterioration trajectory: formerly rented property → rental license lapses → sealed by Clean & Seal → unsafe structure designation → recurring vacant violation citations
+- **Case 2** (violation-only) reveals potential false positives in our OVS definition — commercial properties like parking garages may be flagged as "vacant" through PM15-901.1 violations despite active use
+- **Case 3** (potential false negative) shows properties that OPA classifies as vacant land but that have no current active indicators in our three OVS sources — these may be captured once water utility data is integrated
+
+### Implications for Modeling
+
+- The Clean & Seal source may need **temporal filtering** — a property sealed in 2010 may no longer be vacant in 2026
+- **Building vs. Land** separation is critical: the OPA category_code field can serve as the initial split
+- Commercial properties and parking lots may need special handling to avoid systematic false positives
+- Water utility data (pending from client) will likely capture a significant number of false negatives, particularly for vacant land parcels
