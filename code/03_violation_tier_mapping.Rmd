@@ -1,0 +1,702 @@
+---
+title: "PhillyStat360 — Violation Tier Mapping"
+subtitle: "VacancyGuide2026 Verification & Complete Building Tier Reference"
+author: "Zhe Fang"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+
+# 0. Purpose
+
+This document builds the **complete violation tier mapping** for the PhillyStat360 
+building model. It replaces the earlier `violation_tier_mapping.xlsx` which contained
+only a partial subset of codes.
+
+**Why this matters:** The current VPI model scores violations on a 3-tier system 
+(+1, +2, +3 points). To engineer violation-based features for our ML model, we need 
+the exact code lists. Getting this wrong means our features won't align with the 
+system we're trying to improve.
+
+**What this document does:**
+
+1. Extracts the **exact code lists** from VacancyGuide2026.pdf (pages 6–7)
+2. Extracts the 54 "vacancy" codes from VIOLATION_DEFINITION.csv 
+3. Cross-compares the two — shows where they overlap and where they don't
+4. Builds the **correct, complete tier mapping** with evidence for every assignment
+5. Defines the two-track query logic for feature engineering
+
+---
+
+# 1. Source of Truth: VacancyGuide2026 Building Violation Tiers
+
+The VacancyGuide2026.pdf (received from Taylor Popp, Feb 5 2026) defines three 
+violation tiers for the **building model** on pages 6–7. Each tier is specified as 
+a SQL `IN (...)` clause with an exact list of violation codes.
+
+Key rules from the guide (p.7, footnote 2):
+
+- Only violations with `violationstatus = 'OPEN'` count
+- Only violations that are `"current"` count (i.e., the inspection occurred more 
+  recently than the most recent construction or demolition)
+- **Only the highest applicable tier is scored per property** — not cumulative across tiers
+
+We now transcribe these code lists verbatim from the PDF.
+
+```{r vacancyguide-codes}
+# ============================================================
+# VacancyGuide2026.pdf, page 6–7: VACANT BUILDING INDICATORS
+# Transcribed directly from the SQL IN() clauses
+# ============================================================
+
+# Level 1: Add one (1) to Vacant Building Score
+# Source: VacancyGuide p.6, first L+I Violations bullet
+guide_level1 <- c(
+  "PM15-304.10",   # EXTERIOR STRUCT STAIRS, ETC
+  "PM15-304.11",   # EXTERIOR STRUCT CHIM TOWERS
+  "PM15-304.19",   # DOOR AND WINDOW OCCUPIED/MIXED
+  "PM15-304.19O",  # DOOR AND WINDOW OCCUPIED/MIXED
+  "PM15-304.2",    # EXTERIOR STRUCT PROTECTIVE TRE
+  "PM15-304.8",    # EXTERIOR STRUCT DEC FEATURES
+  "PM15-308.1",    # RUBBISH AND GARBAGE
+  "PM15-309.1",    # PEST ELIMINATION INFESTATION
+  "PM15-309.3",    # PEST ELIM INFEST SGLE OCCUP
+  "PM15-309.4",    # PEST ELIMINATION INFESTATION
+  "PM-302.2/1",    # EXT A-CLEAN/EXTERMINATE
+  "PM-302.2/2",    # EXT A-CLEAN RUBBISH/GARBAGE
+  "PM-302.3/1",    # EXT A-CLEAN WEEDS/PLANTS
+  "PM-302.4/6",    # DRAINAGE-DOWNSPOUT CONNECT
+  "PM-302.4/7",    # DRAINAGE-DOWNSPOUT REPR/REPLC
+  "PM-304.1/1",    # EXT S-EXTERIOR REPAIR/MAINTAIN
+  "PM-304.6/1",    # EXT S-CHIMMEYS/TOWERS MAINTAIN
+  "PM-304.8/1",    # EXT S-WINDOW REPAIR/MAINTAIN
+  "PM-304.8/15",   # EXT S-DOOR WEATHERTIGHT
+  "PM-304.8/16",   # EXT S-WINDOW REPAIR/REPLACE
+  "PM-304.8/17",   # EXT S-DOOR REPAIR/REPLACE
+  "PM-304.8/18",   # EXT S-DOORFRAME REPAIR/REPLACE
+  "PM-304.8/19",   # EXT S-WINDOW/FRAME RODENTPROOF
+  "PM-304.8/2",    # EXT S-DOORS MAINTAIN
+  "PM-304.8/20",   # EXT S-DOORS/FRAMES RODENTPROOF
+  "PM-304.8/21"    # MIX USE PROP REPLAC W/D 80%
+)
+
+# Level 2: Add two (2) to Vacant Building Score
+# Source: VacancyGuide p.7, second L+I Violations bullet
+guide_level2 <- c(
+  "PM15-110.7",    # ID WORK SCHEDULE REQ
+  "PM15-302.1",    # EXTERIOR AREA SANITATION
+  "PM15-302.4",    # EXTERIOR AREA WEEDS
+  "PM15-302.5",    # EXTERIOR AREA RODENT HARBORAGE
+  "PM15-304.13",   # EXTERIOR STRUCTURE WINDOWS
+  "PM15-304.15",   # EXTERIOR STRUCTURE DOORS
+  "PM15-304.16",   # EXTERIOR STRUCTURE HATCHWAY
+  "PM15-304.4",    # EXTERIOR STRUCT STRUCTURAL MEM
+  "PM15-304.5",    # EXTERIOR STRUCTURE FOUNDATIONS
+  "PM15-304.6",    # EXTERIOR STRUCTURE WALLS
+  "PM15-304.7",    # EXTERIOR STRUCT ROOF DRAINAGE
+  "PM-304.2/1",    # EXT S-FOUNDATION WALLS, MAINTA
+  "PM-304.3/1",    # EXT S-WALLS REPAIR/MAINTAIN
+  "PM-304.3/2",    # EXT S-WALLS MAKE WEATHERTIGHT
+  "PM-304.3/3",    # EXT S-WALLS REPAIR BULGING
+  "PM-304.3/4",    # EXT S-WALLS REPAIR CRACKS
+  "PM-304.3/5",    # EXT S-WALLS REPAIR STUCCO
+  "PM-304.5/2",    # EXT S-EXPOSED SURFACES MAINTAI
+  "PM-304.5/3"     # EXT S-CORNICE BARGEBOARD DEFEC
+)
+
+# Level 3: Add three (3) to Vacant Building Score
+# Source: VacancyGuide p.7, third L+I Violations bullet
+guide_level3 <- c(
+  "9-3905",        # VACANT STRUCTURE LICENSE
+  "CP-103",        # LICENSE - VACANT BUILDING
+  "PM-102.4/2",    # LICENSE-VAC RES BLDG
+  "PM-102.4/4",    # LICENSE-VAC COMM BLDG
+  "PM15-108.1",    # UNSAFE STRUCTURE
+  "PM15-108.2",    # VACANT AND OPEN
+  "PM15-109.1",    # UNFIT STRUCTURE
+  "PM15-110.1",    # ID STRUCTURE
+  "PM15-301",      # VACANT STRUCTURE AND LAND
+  "PM15-304.1",    # EXTERIOR STRUCTURALLY UNSAFE
+  "PM15-304.19V",  # DOOR AND WINDOW VACANT
+  "PM15-304.1A",   # EXTERIOR STRUCT UNSAFE COND 1
+  "PM15-304.1B",   # EXTERIOR STRUCT UNSAFE COND 2
+  "PM15-304.1C",   # EXTERIOR STRUCT UNSAFE COND 3
+  "PM15-304.1D",   # EXTERIOR STRUCT UNSAFE COND 4
+  "PM15-304.1E",   # EXTERIOR STRUCT UNSAFE COND 5
+  "PM15-304.1F",   # EXTERIOR STRUCT UNSAFE COND 6
+  "PM15-304.1G",   # EXTERIOR STRUCT UNSAFE COND 7
+  "PM15-304.1H",   # EXTERIOR STRUCT UNSAFE COND 8
+  "PM15-304.1I",   # EXTERIOR STRUCT UNSAFE COND 9
+  "PM15-304.1J",   # EXTERIOR STRUCT UNSAFE COND 10
+  "PM15-901.1",    # VACANT PROPERTIES-GENERAL
+  "PM15-901.2",    # VACANT PROP-BLIGHTED COND
+  "PM15-902.1",    # LARGE VACANT PROP-OPENINGS
+  "PM-304.4/1",    # EXT S-ROOF REPAIR
+  "PM-306.0/1",    # VACANT PROP STANDARD
+  "PM-306.0/90",   # VACANT BLDG KEEP CLEAN GET LIC
+  "PM-306.2/1",    # VACANT BLDG UNSECURED COUNT
+  "PM-306.2/4",    # VAC PROP REPLAC WIN/DRS 80%
+  "PM-306.2/90",   # VACANT BLDG - VOTA
+  "PM-306.2/91",   # CP VAC PROP REPLAC WIN/DRS 80%
+  "PM-306.2/92",   # VAC PROP REPLAC WIN/DRS 80% CP
+  "PM-307.1/1",    # VACANT PROP UNSAFE
+  "PM-307.1/11",   # WALL DETERIORATION
+  "PM-307.1/12",   # WALL PARTIALLY COLLAPSED
+  "PM-307.1/13",   # WALL FIRE DAMAGED
+  "PM-307.1/19",   # VACANT BLDG UNSEC/UNSAFE CSU
+  "PM-307.1/2",    # ROOF DETERIORATION
+  "PM-307.1/3",    # ROOF PARTIALLY COLLAPSED
+  "PM-307.1/4",    # ROOF FIRE DAMAGED
+  "PM-307.1/5",    # F/C DETERIORATED
+  "PM-307.1/6",    # FLOOR/CEILING PARTIALLY COLL
+  "PM-307.1/7",    # FLOOR/CEILING FIRE DAMAGED
+  "PM-307.1/8",    # WALL BULGED
+  "PM-307.1/9",    # WALL FRACTURED
+  "PM-307.1/90",   # VACANT BLDG - UNSAFE
+  "PM-307.2/1",    # VACANT PROP UNSAFE EQUIPMENT
+  "PM-307.3/1",    # UNFIT PROP STANDARD
+  "PM-307.3/2",    # UNFIT PROP CEASED
+  "PM-307.3/90",   # UNSAFE - UNFIT NO EVAC
+  "PM-307.3/91",   # UNSAFE - UNFIT RELOCATE
+  "PM-308.1/1",    # ROOF DETERIORATED ID
+  "PM-308.1/10",   # WALL DETERIORATED IDF
+  "PM-308.1/11",   # WALL PARTIALLY COLLAPSED ID
+  "PM-308.1/12",   # WALL FIRE DAMAGED ID
+  "PM-308.1/2",    # ROOF PARTIALLY COLLAPSED ID
+  "PM-308.1/3",    # ROOF FIRE DAMAGED ID
+  "PM-308.1/4",    # F/C DETERIORATED ID COLLAPSE
+  "PM-308.1/5",    # FLOOR/CEILING PARTIALLY C ID
+  "PM-308.1/6",    # FLOOR/CEILING FIRE DAMAGED ID
+  "PM-308.1/7",    # WALL BULGED ID
+  "PM-308.1/8",    # WALL CRACK/FRACT ID
+  "PM-308.1/9"     # WALL LOOSE/MISS BRICKS ID
+)
+
+# Also from VacancyGuide p.5: VACANT LAND violation codes
+# These are separate from the building model
+guide_land <- c(
+  "CP-102",        # LICENSE - VACANT LOT
+  "PM-102.4/1",    # LICENSE-VAC LOT
+  "PM-102.4/3",    # LICENSE-VAC WHARF/PIER
+  "PM-302.2/4",    # EXT A-VACANT LOT CLEAN/MAINTAI
+  "PM-304.9/2",    # PIER-VACANT FAULTY/NO BARRIER
+  "PM-304.9/3",    # PIER-VACANT POST SIGNS
+  "PM-304.9/4",    # PIER-VACANT OBTAIN LICENSE
+  "PM-306.0/2",    # VACANT LOT STANDARD
+  "PM-306.0/91"    # VACANT LOT KEEP CLEAN GET LIC
+)
+
+cat("=== VacancyGuide Building Code Counts ===\n")
+cat("Level 1 (+1 point):", length(guide_level1), "codes\n")
+cat("Level 2 (+2 points):", length(guide_level2), "codes\n")
+cat("Level 3 (+3 points):", length(guide_level3), "codes\n")
+cat("Building total:     ", length(guide_level1) + length(guide_level2) + length(guide_level3), "codes\n")
+cat("\nLand violations:    ", length(guide_land), "codes\n")
+cat("Grand total:        ", length(guide_level1) + length(guide_level2) + length(guide_level3) + length(guide_land), "codes\n")
+
+# Verify no duplicates across building tiers
+building_all <- c(guide_level1, guide_level2, guide_level3)
+stopifnot("Duplicate codes across building tiers!" = length(building_all) == length(unique(building_all)))
+cat("\n✓ No duplicate codes across building tiers\n")
+
+# Check overlap between building and land
+bldg_land_overlap <- intersect(building_all, guide_land)
+cat("Building-Land overlap:", length(bldg_land_overlap), "codes\n")
+if (length(bldg_land_overlap) > 0) cat("  ", paste(bldg_land_overlap, collapse = ", "), "\n")
+```
+
+**Key observation:** The VacancyGuide uses **`r length(building_all)` codes** 
+for the building model alone. These are not all "vacancy" codes — many are general 
+building maintenance codes (rubbish, windows, drainage) that the city's model treats 
+as indirect vacancy signals.
+
+---
+
+# 2. Our Previous Approach: The 54 "Vacancy" Codes
+
+In `00_data_inventory.Rmd`, we identified 54 violation codes from 
+`VIOLATION_DEFINITION.csv` where the title or definition contains the word "vacant."
+
+```{r our-54-codes}
+violation_def <- read_csv("../rawdata/VIOLATION_DEFINITION.csv", show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+our_54 <- violation_def %>%
+  filter(str_detect(tolower(violation_code_title), "vacant") |
+         str_detect(tolower(violation_definition), "vacant")) %>%
+  pull(violation_code)
+
+cat("Codes found by searching 'vacant' in title/definition:", length(our_54), "\n")
+```
+
+---
+
+# 3. The Gap: Cross-Comparison
+
+This is the critical analysis. How much overlap is there between the VacancyGuide's 
+108 building codes and our keyword-based 54 codes?
+
+```{r cross-comparison}
+overlap     <- intersect(building_all, our_54)
+in_guide_not_54 <- setdiff(building_all, our_54)
+in_54_not_guide <- setdiff(our_54, building_all)
+
+cat("=== Cross-Comparison ===\n\n")
+cat("In BOTH VacancyGuide building tiers AND our 54:", length(overlap), "\n")
+cat("In VacancyGuide but NOT in our 54:             ", length(in_guide_not_54), "\n")
+cat("In our 54 but NOT in VacancyGuide building:    ", length(in_54_not_guide), "\n")
+```
+
+### 3a. Codes in VacancyGuide but Missing from Our 54
+
+These are the codes we would have **missed entirely** if we only used our 54-code list 
+for feature engineering. They are mostly general building maintenance codes — 
+the word "vacant" does not appear in their title or definition.
+
+```{r guide-only-codes}
+# For each missing code, show which tier it belongs to and its title
+guide_only_df <- tibble(code = in_guide_not_54) %>%
+  mutate(
+    tier = case_when(
+      code %in% guide_level1 ~ "Level 1 (+1)",
+      code %in% guide_level2 ~ "Level 2 (+2)",
+      code %in% guide_level3 ~ "Level 3 (+3)"
+    )
+  ) %>%
+  left_join(
+    violation_def %>% select(violation_code, violation_code_title),
+    by = c("code" = "violation_code")
+  ) %>%
+  arrange(tier, code)
+
+guide_only_df %>%
+  kable(col.names = c("Code", "VacancyGuide Tier", "Title (from VIOLATION_DEFINITION)"),
+        caption = paste0(length(in_guide_not_54),
+                         " codes in VacancyGuide building tiers but NOT in our 54 'vacancy' codes")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12) %>%
+  row_spec(which(guide_only_df$tier == "Level 1 (+1)"), background = "#FFF9C4") %>%
+  row_spec(which(guide_only_df$tier == "Level 2 (+2)"), background = "#FFE0B2") %>%
+  row_spec(which(guide_only_df$tier == "Level 3 (+3)"), background = "#FFCDD2")
+```
+
+**Why this gap exists:** Our 54-code list was built by text-searching for "vacant" in 
+violation titles/definitions. But VacancyGuide Level 1 and Level 2 are almost entirely 
+made up of general property maintenance codes (rubbish, drainage, window repair, pest 
+control, etc.) — they don't contain the word "vacant" because they can occur at any 
+property. The city's model includes them because L&I observed that these violations 
+*tend to cluster on properties trending toward vacancy*, even though they also occur 
+at occupied properties.
+
+### 3b. Our 54 Codes Not in VacancyGuide Building Tiers
+
+These codes contain "vacant" in their title but are NOT used in the VacancyGuide 
+building model. Why?
+
+```{r our-only-codes}
+our_only_df <- tibble(code = in_54_not_guide) %>%
+  left_join(
+    violation_def %>% select(violation_code, violation_code_title),
+    by = c("code" = "violation_code")
+  ) %>%
+  mutate(
+    likely_reason = case_when(
+      code %in% guide_land ~ "Used in LAND model, not building",
+      str_detect(tolower(violation_code_title), "lot") ~ "Land/lot-specific code",
+      str_detect(code, "^F-|^FC-") ~ "Fire safety code — not in VacancyGuide scoring",
+      str_detect(code, "9-3904") ~ "Vacant LOT license (land model)",
+      str_detect(code, "9-3906|9-3907") ~ "Waterfront/managing agent — not in scoring",
+      str_detect(code, "PM15-902") ~ "Large vacant property sub-codes (902.3, 902.7 not scored)",
+      TRUE ~ "Review needed"
+    )
+  ) %>%
+  arrange(code)
+
+our_only_df %>%
+  kable(col.names = c("Code", "Title", "Likely Reason Not in Building Tiers"),
+        caption = paste0(length(in_54_not_guide),
+                         " codes in our 54 but NOT in VacancyGuide building tiers")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+### 3c. Overlap — Codes in Both Sets
+
+```{r overlap-codes}
+overlap_df <- tibble(code = overlap) %>%
+  mutate(
+    tier = case_when(
+      code %in% guide_level1 ~ "Level 1 (+1)",
+      code %in% guide_level2 ~ "Level 2 (+2)",
+      code %in% guide_level3 ~ "Level 3 (+3)"
+    )
+  ) %>%
+  left_join(
+    violation_def %>% select(violation_code, violation_code_title),
+    by = c("code" = "violation_code")
+  ) %>%
+  arrange(tier, code)
+
+overlap_df %>%
+  kable(col.names = c("Code", "VacancyGuide Tier", "Title"),
+        caption = paste0(length(overlap),
+                         " codes that appear in BOTH our 54 and VacancyGuide building tiers")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+**Notice:** All `r length(overlap)` overlapping codes are in **Level 3** — the most 
+severe tier. This makes sense: Level 3 contains codes that explicitly reference 
+"vacant," "unsafe," or "unfit" in their titles. Levels 1 and 2 are composed entirely 
+of general maintenance codes that don't mention "vacant."
+
+### 3d. Summary Diagram
+
+```{r summary-counts, fig.width=8, fig.height=4}
+summary_df <- tribble(
+  ~category, ~count, ~group,
+  "Level 1 in Guide, NOT in 54",  sum(in_guide_not_54 %in% guide_level1), "Guide only",
+  "Level 2 in Guide, NOT in 54",  sum(in_guide_not_54 %in% guide_level2), "Guide only",
+  "Level 3 in Guide, NOT in 54",  sum(in_guide_not_54 %in% guide_level3), "Guide only",
+  "Level 3 overlap (in both)",    length(overlap), "Overlap",
+  "In 54 only (not in Guide bldg)", length(in_54_not_guide), "54 only"
+)
+
+summary_df %>%
+  mutate(category = fct_inorder(category)) %>%
+  ggplot(aes(x = category, y = count, fill = group)) +
+  geom_col() +
+  geom_text(aes(label = count), vjust = -0.3, size = 4) +
+  scale_fill_manual(values = c("Guide only" = "#E53935", "Overlap" = "#43A047", "54 only" = "#1E88E5")) +
+  labs(title = "VacancyGuide Building Codes vs. Our 54 'Vacancy' Codes",
+       subtitle = "85 codes in the Guide are NOT in our 54 — mostly Level 1 & 2 maintenance codes",
+       x = NULL, y = "Number of Codes", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1, size = 10))
+```
+
+---
+
+# 4. Correct Complete Tier Mapping
+
+Now we build the **definitive reference table** that downstream feature engineering 
+code will use. Every code gets its tier assignment directly from VacancyGuide.
+
+```{r complete-mapping}
+# Build the complete building tier mapping
+building_tier_map <- bind_rows(
+  tibble(code = guide_level1, guide_tier = "Level 1", guide_weight = 1L),
+  tibble(code = guide_level2, guide_tier = "Level 2", guide_weight = 2L),
+  tibble(code = guide_level3, guide_tier = "Level 3", guide_weight = 3L)
+) %>%
+  left_join(
+    violation_def %>% select(violation_code, violation_code_title),
+    by = c("code" = "violation_code")
+  ) %>%
+  mutate(
+    in_our_54   = code %in% our_54,
+    in_ovs_def  = code %in% c("9-3904", "9-3905", "PM15-901.1", "PM15-901.2", "PM15-301",
+                                "CP-102", "CP-103", "PM-102.4/1", "PM-102.4/2", 
+                                "PM-102.4/3", "PM-102.4/4"),
+    code_type = case_when(
+      in_our_54 & in_ovs_def ~ "Vacancy code + OVS source",
+      in_our_54              ~ "Vacancy code (not in OVS)",
+      TRUE                   ~ "General maintenance code"
+    )
+  ) %>%
+  arrange(guide_weight, code)
+
+cat("=== Complete Building Tier Mapping ===\n")
+cat("Total codes:", nrow(building_tier_map), "\n\n")
+
+building_tier_map %>%
+  count(guide_tier, code_type) %>%
+  pivot_wider(names_from = code_type, values_from = n, values_fill = 0) %>%
+  kable(caption = "Breakdown by tier and code type") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### 4a. Full Level 1 Codes (+1 point)
+
+```{r level1-table}
+building_tier_map %>%
+  filter(guide_weight == 1) %>%
+  select(code, violation_code_title, code_type) %>%
+  kable(col.names = c("Code", "Title", "Type"),
+        caption = paste0("Level 1: ", sum(building_tier_map$guide_weight == 1),
+                         " codes — Minor deterioration, may occur at occupied properties")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+### 4b. Full Level 2 Codes (+2 points)
+
+```{r level2-table}
+building_tier_map %>%
+  filter(guide_weight == 2) %>%
+  select(code, violation_code_title, code_type) %>%
+  kable(col.names = c("Code", "Title", "Type"),
+        caption = paste0("Level 2: ", sum(building_tier_map$guide_weight == 2),
+                         " codes — Moderate structural damage, stronger vacancy signal")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+### 4c. Full Level 3 Codes (+3 points)
+
+```{r level3-table}
+building_tier_map %>%
+  filter(guide_weight == 3) %>%
+  select(code, violation_code_title, code_type) %>%
+  kable(col.names = c("Code", "Title", "Type"),
+        caption = paste0("Level 3: ", sum(building_tier_map$guide_weight == 3),
+                         " codes — Severe: vacant, unsafe, unfit, or major collapse")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+---
+
+# 5. Vacant Land Codes (Separate Model)
+
+For completeness, here are the land model violation codes (VacancyGuide p.5).
+
+```{r land-codes}
+land_tier_map <- tibble(code = guide_land, guide_weight = 1L) %>%
+  left_join(
+    violation_def %>% select(violation_code, violation_code_title),
+    by = c("code" = "violation_code")
+  ) %>%
+  arrange(code)
+
+land_tier_map %>%
+  kable(col.names = c("Code", "Weight", "Title"),
+        caption = paste0("Vacant Land: ", nrow(land_tier_map),
+                         " codes — All weighted +1")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+---
+
+# 6. Validation Against violations.csv
+
+Now let's check: how many of these codes actually appear in our violation data, 
+and with what frequency?
+
+```{r validate-against-data}
+violations <- read_csv("../rawdata/violations.csv", show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+# Count OPEN violations for each building tier code
+building_viol_counts <- violations %>%
+  filter(violationcode %in% building_all,
+         tolower(violationstatus) == "open") %>%
+  count(violationcode, name = "n_open") %>%
+  right_join(building_tier_map %>% select(code, guide_tier, guide_weight),
+             by = c("violationcode" = "code")) %>%
+  replace_na(list(n_open = 0)) %>%
+  arrange(guide_weight, desc(n_open))
+
+cat("=== OPEN violations by tier ===\n")
+building_viol_counts %>%
+  group_by(guide_tier) %>%
+  summarise(
+    n_codes_with_data = sum(n_open > 0),
+    n_codes_total     = n(),
+    total_open_viols  = sum(n_open),
+    .groups = "drop"
+  ) %>%
+  kable(col.names = c("Tier", "Codes with ≥1 OPEN", "Total Codes", "Total OPEN Violations"),
+        caption = "How many VacancyGuide codes actually have OPEN records in our data?") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Top 20 Most Frequent OPEN Violation Codes (Building Tiers)
+
+```{r top-codes}
+building_viol_counts %>%
+  filter(n_open > 0) %>%
+  head(20) %>%
+  kable(col.names = c("Code", "OPEN Count", "Tier", "Weight"),
+        caption = "Top 20 building tier codes by OPEN violation count") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+### Codes with Zero OPEN Violations
+
+```{r zero-codes}
+zero_codes <- building_viol_counts %>% filter(n_open == 0)
+
+cat(nrow(zero_codes), "building tier codes have zero OPEN violations in current data.\n")
+cat("These may be legacy codes or codes whose violations have all been resolved.\n\n")
+
+zero_codes %>%
+  kable(col.names = c("Code", "OPEN Count", "Tier", "Weight")) %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+---
+
+# 7. Feature Engineering Implications
+
+### Methodological concern: avoid importing external bias
+
+The VacancyGuide tier system (Level 1/2/3) was constructed through expert judgment 
+and trial-and-error, not statistical analysis (confirmed by Tim Haynes at the Jan 27 
+kickoff meeting). Using these predetermined tiers directly as ML features risks:
+
+1. **Importing subjective bias** — the tier assignments reflect someone else's 
+   assumptions about which violations matter more, without empirical validation.
+2. **Collinearity** — tier-based features are derived from the same underlying 
+   violation codes, so `max_violation_tier`, `has_level2`, and `n_violations_L2` 
+   will be mechanically correlated.
+3. **Information loss** — collapsing 108 codes into 3 tiers discards variation 
+   that the ML model could learn from.
+
+Per instructor feedback (Prof. Fichman, Feb 18 2026): feature engineering should 
+start from **raw violation data** and use **univariate correlation analysis** to 
+determine which features are genuinely predictive, rather than assuming the city's 
+groupings are correct.
+
+### Recommended approach: raw features first, tiers as comparison
+
+**Track A (Primary): Raw violation features — let the model learn**
+
+Built directly from violations.csv without imposing any external grouping.
+
+| Feature | Logic |
+|---------|-------|
+| `n_violations_total` | Count of ALL violations on the property (any code) |
+| `n_violations_open` | Count of currently OPEN violations |
+| `n_violation_codes_distinct` | Number of distinct violation codes on the property |
+| `oldest_open_violation_days` | Days since the oldest OPEN violation |
+| `newest_violation_days` | Days since the most recent violation |
+| `has_vacancy_code` | Binary: any of the 54 vacancy keyword codes present |
+| `has_structural_code` | Binary: any PM15-304.x / PM-307.x structural codes present |
+| `has_unsafe_code` | Binary: PM15-108.1 (Unsafe) or PM15-108.2 (Vacant & Open) present |
+| `has_fire_code` | Binary: any F-xxx / FC-xxx fire safety codes present |
+| `n_vacancy_violations` | Count of violations with vacancy keyword codes |
+
+These features preserve the full variation in the data. The ML model determines 
+which violation patterns are most predictive of OVS — we do not pre-impose weights.
+
+**Track B (Comparison): VacancyGuide tier features — for benchmarking**
+
+Uses the 108-code tier mapping from this document. These features are included 
+**only to compare against Track A** and to evaluate whether the city's existing 
+groupings add predictive value beyond raw features.
+
+| Feature | Logic |
+|---------|-------|
+| `max_violation_tier` | Highest tier (0/1/2/3) among OPEN violations |
+| `guide_score_raw` | Sum of tier weights across OPEN violations (replicates VPI logic) |
+| `has_level1_violation` | Binary: any Level 1 OPEN violation present |
+| `has_level2_violation` | Binary: any Level 2 OPEN violation present |
+| `has_level3_violation` | Binary: any Level 3 OPEN violation present |
+
+**Track C (Validation): Univariate correlation analysis**
+
+Before any modeling, we will:
+
+1. Compute correlation of each Track A and Track B feature with OVS
+2. Build a feature-to-feature correlation heatmap to identify collinearity
+3. Create facet plots of continuous features split by OVS (0 vs 1)
+4. Use these results to decide which features enter the model and whether 
+   tier-based groupings are empirically justified
+
+This ensures we are not importing the city's heuristic assumptions as ground truth, 
+while still being able to evaluate whether their expert judgment aligns with the data.
+
+---
+
+# 8. Non-Violation Indicators from VacancyGuide
+
+For completeness, here are the other building model indicators from VacancyGuide 
+(pages 6–7) that are NOT violation-based:
+
+```{r non-violation-indicators}
+tribble(
+  ~indicator, ~source, ~weight, ~data_status,
+  "Water: NB9 (Vacant) installation status, excl. type 24", "Water Revenue", "+1", "Pending legal",
+  "Water: No usage 4+ months (excl. NB3/NB9/NB2/NB8/type24/fire/commercial/stormwater)", "Water Revenue", "+1", "Pending legal",
+  "PWD: Side yard exemption for stormwater billing", "PWD", "Reset to 0", "Pending legal",
+  "Permit: completed in last 4 years (plumbing/demolition/electrical/fire suppression/mechanical/building new construction/alteration)", "L+I Permits", "-1", "To download",
+  "License: Active rental license (revenuecode = 3202)", "Business Licenses", "-1", "Available",
+  "License: Active vacancy license (revenuecode IN 3219, 3634)", "Business Licenses", "+2", "Available",
+  "Permit: Completed demolition without subsequent new construction", "L+I Permits", "Reset to 0", "To download"
+) %>%
+  kable(col.names = c("Indicator", "Source", "Weight", "Data Status"),
+        caption = "Non-violation building indicators from VacancyGuide") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, font_size = 12)
+```
+
+---
+
+# 9. Corrections to Previous Work
+
+This analysis identified the following errors in our earlier `violation_tier_mapping.xlsx`:
+
+1. **VacancyGuide Building Tiers sheet listed 11 codes; the actual count is 108.** 
+   The Excel showed 3 Level 1, 3 Level 2, and 5 Level 3 codes as representative 
+   examples, but these were incomplete. The correct counts are 26 / 19 / 63.
+
+2. **"54 vacancy codes" ≠ VacancyGuide tier codes.** The 54-code list was built by 
+   keyword search ("vacant") and captures a different dimension. Only 23 codes overlap, 
+   all in Level 3. The entire Level 1 (26 codes) and Level 2 (19 codes) were absent 
+   from our 54.
+
+3. **Feature Plan assumed two tracks; actually needs three.** The original plan 
+   correctly noted that Level 1/2 codes are "not in our 54" but underestimated the 
+   scope (6 codes mentioned vs. 85 actual). The feature plan is still valid in 
+   structure but needs to use the complete code lists from this document.
+
+---
+
+# 10. Export Reference Tables
+
+Save the tier mapping as CSV for use in downstream Rmd files.
+
+```{r export}
+# Ensure output directory exists
+dir.create("../data", showWarnings = FALSE, recursive = TRUE)
+
+# Building tier mapping
+building_tier_map %>%
+  select(code, guide_tier, guide_weight, violation_code_title, in_our_54, in_ovs_def) %>%
+  write_csv("../data/building_tier_mapping.csv")
+
+# Land codes
+land_tier_map %>%
+  write_csv("../data/land_violation_codes.csv")
+
+# Our 54 vacancy codes (still useful as a separate reference)
+tibble(code = our_54) %>%
+  left_join(violation_def %>% select(violation_code, violation_code_title),
+            by = c("code" = "violation_code")) %>%
+  write_csv("../data/vacancy_keyword_codes_54.csv")
+
+cat("Exported:\n")
+cat("  ../data/building_tier_mapping.csv (", nrow(building_tier_map), " rows)\n")
+cat("  ../data/land_violation_codes.csv  (", nrow(land_tier_map), " rows)\n")
+cat("  ../data/vacancy_keyword_codes_54.csv (", length(our_54), " rows)\n")
+```
+
+---
+
+# References
+
+- **VacancyGuide2026.pdf** — "Vacant Property Indicators Model," updated 2/3/2026, 
+  received from Taylor Popp via email on Feb 5, 2026. Pages 6–7 contain the building 
+  model SQL queries; page 5 contains the land model queries; pages 8–10 contain the 
+  reference violation code table.
+- **VIOLATION_DEFINITION.csv** — L+I violation code lookup table, downloaded from 
+  OpenDataPhilly (L+I Code Violations attachment).
+- **Kickoff meeting notes** (Jan 27, 2026) — Tim Haynes confirmed: "only the most 
+  severe violation is scored per property"; weights were set through trial and error.
