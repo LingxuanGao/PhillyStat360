@@ -1,0 +1,460 @@
+---
+title: "04 - Clean & Seal Cutoff Analysis (Updated)"
+author: "PhillyStat360"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 6)
+library(tidyverse)
+library(scales)
+library(knitr)
+library(kableExtra)
+
+data_path <- "../rawdata/"
+```
+
+# 1. Load Data
+
+```{r load-data}
+clean_seal <- read_csv(paste0(data_path, "clean_seal.csv"), show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+properties <- read_csv(paste0(data_path, "opa_properties_public.csv"), show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+violations <- read_csv(paste0(data_path, "violations.csv"), show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+licenses <- read_csv(paste0(data_path, "business_licenses.csv"), show_col_types = FALSE) %>%
+  janitor::clean_names()
+```
+
+# 2. Clean & Seal Field Exploration
+
+Before deciding on cutoff strategy, we need to understand what status/date fields are available.
+
+```{r cs-fields}
+# List all columns
+cat("All columns in clean_seal:\n")
+cat(paste(names(clean_seal), collapse = "\n"))
+```
+
+```{r cs-date-fields}
+# Identify date-related columns
+date_cols <- names(clean_seal)[str_detect(tolower(names(clean_seal)), "date|completed")]
+cat("\nDate-related columns:", paste(date_cols, collapse = ", "), "\n")
+
+# Identify status-related columns
+status_cols <- names(clean_seal)[str_detect(tolower(names(clean_seal)), "status")]
+cat("Status-related columns:", paste(status_cols, collapse = ", "), "\n")
+```
+
+## 2a. Work Order Status Breakdown
+
+`workorderstatus` tells us whether the boarding-up work was actually carried out.
+
+```{r cs-wo-status}
+clean_seal %>%
+  filter(!is.na(opa_account_num)) %>%
+  count(workorderstatus, sort = TRUE) %>%
+  mutate(pct = percent(n / sum(n), accuracy = 0.1)) %>%
+  kable(col.names = c("Work Order Status", "Records", "Pct"),
+        caption = "Work order status breakdown (all records with valid OPA)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+**Interpretation:**
+
+- `CLOSED` = physical boarding-up work was completed → the building **was** sealed
+- `CANCELLED` = work order was cancelled → building **may not** have been sealed
+- `APPROVED` / other = work authorized but status unclear
+
+## 2b. Case Completed Date Coverage
+
+`casecompleteddate` indicates when the case was resolved. `NA` means the case is **still open**.
+
+```{r cs-completed}
+cs <- clean_seal %>%
+  filter(!is.na(opa_account_num)) %>%
+  mutate(
+    year_created = year(casecreateddate),
+    case_completed = !is.na(casecompleteddate),
+    wo_completed = !is.na(workordercompleteddate)
+  )
+
+cat("Total records (with valid OPA):", comma(nrow(cs)), "\n")
+cat("Has casecompleteddate:", comma(sum(cs$case_completed)), 
+    "(", percent(mean(cs$case_completed), accuracy = 0.1), ")\n")
+cat("Missing casecompleteddate (case still open?):", comma(sum(!cs$case_completed)),
+    "(", percent(mean(!cs$case_completed), accuracy = 0.1), ")\n")
+cat("\nHas workordercompleteddate:", comma(sum(cs$wo_completed)),
+    "(", percent(mean(cs$wo_completed), accuracy = 0.1), ")\n")
+```
+
+## 2c. Cross-tab: Work Order Status × Case Completed
+
+This shows the relationship between work completion and case closure.
+
+```{r cs-crosstab}
+cs %>%
+  mutate(case_closed = ifelse(case_completed, "Case Closed", "Case Open")) %>%
+  count(workorderstatus, case_closed) %>%
+  pivot_wider(names_from = case_closed, values_from = n, values_fill = 0) %>%
+  kable(caption = "Work Order Status vs Case Closure") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+# 3. Defining "Still Likely Vacant" via Case Status
+
+Rather than relying solely on year cutoffs, we can use case status to identify parcels that are **more likely still vacant**:
+
+- **Strongest signal:** `casecompleteddate` is NA (case never resolved → building likely still sealed)
+- **Medium signal:** Case completed but work order was `CLOSED` (work was done — sealed at some point, but case is now closed, meaning issue may have been addressed)
+- **Weak/exclude:** Work order `CANCELLED` (building may never have been sealed)
+
+```{r cs-status-logic}
+cs <- cs %>%
+  mutate(
+    cs_status_category = case_when(
+      is.na(casecompleteddate) & workorderstatus == "CLOSED" ~ "Open case, work done",
+      is.na(casecompleteddate) & workorderstatus == "CANCELLED" ~ "Open case, cancelled",
+      is.na(casecompleteddate) ~ "Open case, other status",
+      !is.na(casecompleteddate) & workorderstatus == "CLOSED" ~ "Closed case, work done",
+      !is.na(casecompleteddate) & workorderstatus == "CANCELLED" ~ "Closed case, cancelled",
+      TRUE ~ "Closed case, other status"
+    )
+  )
+
+cs %>%
+  count(cs_status_category, sort = TRUE) %>%
+  mutate(
+    pct = percent(n / sum(n), accuracy = 0.1),
+    distinct_parcels = map_int(cs_status_category, ~n_distinct(cs$opa_account_num[cs$cs_status_category == .x]))
+  ) %>%
+  kable(col.names = c("Category", "Records", "Pct", "Distinct Parcels"),
+        caption = "Clean & Seal records by status category") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+# 4. Year Distribution by Status Category
+
+Do older records tend to be closed while recent ones stay open? This helps validate whether status is a better filter than year.
+
+```{r cs-year-status}
+cs %>%
+  mutate(case_open = is.na(casecompleteddate)) %>%
+  count(year_created, case_open) %>%
+  mutate(case_open = ifelse(case_open, "Case Still Open", "Case Closed")) %>%
+  ggplot(aes(x = year_created, y = n, fill = case_open)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("Case Still Open" = "tomato", "Case Closed" = "steelblue")) +
+  labs(title = "Clean & Seal Records by Year Created and Case Status",
+       x = "Year Created", y = "Records", fill = NULL) +
+  theme_minimal()
+```
+
+```{r cs-year-status-pct}
+# Proportion of open cases by year
+cs %>%
+  mutate(case_open = is.na(casecompleteddate)) %>%
+  group_by(year_created) %>%
+  summarise(
+    total = n(),
+    n_open = sum(case_open),
+    pct_open = mean(case_open),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = year_created, y = pct_open)) +
+  geom_col(fill = "tomato") +
+  geom_text(aes(label = percent(pct_open, accuracy = 1)), vjust = -0.3, size = 3) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Proportion of Clean & Seal Cases Still Open by Year",
+       subtitle = "Older open cases = stronger vacancy signal (never resolved)",
+       x = "Year Created", y = "% Cases Still Open") +
+  theme_minimal()
+```
+
+# 5. Cutoff Comparison: Year-Based vs. Status-Based
+
+## 5a. Non-CS OVS Sources (Fixed)
+
+These don't change with cutoff choice.
+
+```{r ovs-fixed}
+vacant_viol_codes <- c("9-3904", "9-3905", "PM15-901.1", "PM15-901.2", "PM15-301",
+                        "CP-102", "CP-103", "PM-102.4/1", "PM-102.4/2", 
+                        "PM-102.4/3", "PM-102.4/4")
+
+viol_parcels <- violations %>%
+  filter(violationcode %in% vacant_viol_codes, tolower(violationstatus) == "open") %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+lic_parcels <- licenses %>%
+  filter(tolower(licensestatus) == "active", revenuecode %in% c("3219", "3634")) %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+cat("Violation-based OVS parcels:", comma(length(viol_parcels)), "\n")
+cat("License-based OVS parcels:", comma(length(lic_parcels)), "\n")
+```
+
+## 5b. Year-Based Cutoffs (Original Approach)
+
+```{r cutoff-year}
+cutoffs_year <- c(2016, 2019, 2021, 2023, NA)
+cutoff_labels_year <- c("10yr (2016+)", "7yr (2019+)", "5yr (2021+)", "3yr (2023+)", "No cutoff")
+
+results_year <- map2_dfr(cutoffs_year, cutoff_labels_year, function(yr, label) {
+  if (is.na(yr)) {
+    cs_ids <- cs %>% distinct(opa_account_num) %>% pull(opa_account_num)
+  } else {
+    cs_ids <- cs %>% filter(year_created >= yr) %>% distinct(opa_account_num) %>% pull(opa_account_num)
+  }
+  all_ovs <- unique(c(cs_ids, viol_parcels, lic_parcels))
+  tibble(
+    Method = "Year-Based",
+    Cutoff = label,
+    CS_parcels = length(cs_ids),
+    Total_OVS1 = length(all_ovs),
+    Vacancy_rate = length(all_ovs) / nrow(properties)
+  )
+})
+```
+
+## 5c. Status-Based Cutoffs (New Approach)
+
+```{r cutoff-status}
+# Strategy A: Open cases only (casecompleteddate is NA)
+cs_open_only <- cs %>%
+  filter(is.na(casecompleteddate)) %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+# Strategy B: Open cases + closed cases where work was done (exclude CANCELLED)
+cs_open_plus_closed_work <- cs %>%
+  filter(is.na(casecompleteddate) | workorderstatus == "CLOSED") %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+# Strategy C: Exclude CANCELLED only
+cs_exclude_cancelled <- cs %>%
+  filter(is.na(workorderstatus) | workorderstatus != "CANCELLED") %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+# Strategy D: Open cases only + exclude CANCELLED
+cs_open_no_cancel <- cs %>%
+  filter(is.na(casecompleteddate), 
+         is.na(workorderstatus) | workorderstatus != "CANCELLED") %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+results_status <- tribble(
+  ~Method, ~Cutoff, ~cs_ids,
+  "Status-Based", "A: Open cases only", cs_open_only,
+  "Status-Based", "B: Open + closed w/ work done", cs_open_plus_closed_work,
+  "Status-Based", "C: Exclude CANCELLED", cs_exclude_cancelled,
+  "Status-Based", "D: Open & not cancelled", cs_open_no_cancel,
+) %>%
+  mutate(
+    CS_parcels = map_int(cs_ids, length),
+    Total_OVS1 = map_int(cs_ids, ~length(unique(c(.x, viol_parcels, lic_parcels)))),
+    Vacancy_rate = Total_OVS1 / nrow(properties)
+  ) %>%
+  select(-cs_ids)
+```
+
+## 5d. Combined Comparison Table
+
+```{r cutoff-compare}
+bind_rows(results_year, results_status) %>%
+  mutate(
+    CS_parcels = comma(CS_parcels),
+    Total_OVS1 = comma(Total_OVS1),
+    Vacancy_rate = percent(Vacancy_rate, accuracy = 0.1)
+  ) %>%
+  kable(caption = "OVS=1 under different Clean & Seal filtering strategies") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) %>%
+  pack_rows("Year-Based Cutoffs", 1, 5) %>%
+  pack_rows("Status-Based Cutoffs", 6, 9)
+```
+
+## 5e. Visualization
+
+```{r cutoff-viz, fig.height=7}
+bind_rows(results_year, results_status) %>%
+  mutate(
+    label = paste0(Cutoff, "\n(", percent(Vacancy_rate, accuracy = 0.1), ")"),
+    Cutoff = factor(Cutoff, levels = rev(c(cutoff_labels_year, 
+                                            "A: Open cases only",
+                                            "B: Open + closed w/ work done",
+                                            "C: Exclude CANCELLED",
+                                            "D: Open & not cancelled")))
+  ) %>%
+  ggplot(aes(x = Cutoff, y = Vacancy_rate, fill = Method)) +
+  geom_col() +
+  geom_text(aes(label = percent(Vacancy_rate, accuracy = 0.1)), hjust = -0.1, size = 3) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.12)) +
+  scale_fill_manual(values = c("Year-Based" = "steelblue", "Status-Based" = "coral")) +
+  coord_flip() +
+  labs(title = "Vacancy Rate Under Different Clean & Seal Filtering Strategies",
+       subtitle = "Year-based vs. Status-based approaches",
+       x = NULL, y = "Vacancy Rate") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+# 6. Hybrid Approach: Status + Year
+
+The best strategy may combine both: use case status as the primary filter, with a year cutoff as a secondary safeguard.
+
+```{r hybrid}
+# Hybrid: Open cases only, but also include recent closed cases (last 5 years)
+# Rationale: An open case from 2008 is likely still vacant. 
+#            A closed case from 2024 may have been recently resolved but property could still be vacant.
+
+hybrid_strategies <- list(
+  "Hybrid 1: Open OR created 5yr+" = cs %>%
+    filter(is.na(casecompleteddate) | year_created >= 2021) %>%
+    distinct(opa_account_num) %>% pull(opa_account_num),
+  
+  "Hybrid 2: Open OR created 7yr+" = cs %>%
+    filter(is.na(casecompleteddate) | year_created >= 2019) %>%
+    distinct(opa_account_num) %>% pull(opa_account_num),
+  
+  "Hybrid 3: (Open OR 5yr+) & not cancelled" = cs %>%
+    filter((is.na(casecompleteddate) | year_created >= 2021),
+           is.na(workorderstatus) | workorderstatus != "CANCELLED") %>%
+    distinct(opa_account_num) %>% pull(opa_account_num),
+  
+  "Hybrid 4: (Open OR 7yr+) & not cancelled" = cs %>%
+    filter((is.na(casecompleteddate) | year_created >= 2019),
+           is.na(workorderstatus) | workorderstatus != "CANCELLED") %>%
+    distinct(opa_account_num) %>% pull(opa_account_num)
+)
+
+results_hybrid <- imap_dfr(hybrid_strategies, function(cs_ids, label) {
+  all_ovs <- unique(c(cs_ids, viol_parcels, lic_parcels))
+  tibble(
+    Method = "Hybrid",
+    Cutoff = label,
+    CS_parcels = length(cs_ids),
+    Total_OVS1 = length(all_ovs),
+    Vacancy_rate = length(all_ovs) / nrow(properties)
+  )
+})
+
+results_hybrid %>%
+  mutate(
+    CS_parcels = comma(CS_parcels),
+    Total_OVS1 = comma(Total_OVS1),
+    Vacancy_rate = percent(Vacancy_rate, accuracy = 0.1)
+  ) %>%
+  kable(caption = "OVS=1 under hybrid (Status + Year) strategies") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+# 7. Cross-Validation: Do Old Open Cases Overlap with Other OVS Sources?
+
+If a parcel with an old open Clean & Seal case also has current violations or licenses, that confirms it's still vacant. This helps validate whether keeping old open cases is justified.
+
+```{r cross-validate}
+# Old open cases: created before 2019, case still open
+old_open <- cs %>%
+  filter(is.na(casecompleteddate), year_created < 2019) %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+cat("Old open CS cases (pre-2019, case never closed):", comma(length(old_open)), "\n\n")
+
+# How many also appear in violations or licenses?
+old_open_in_viol <- sum(old_open %in% viol_parcels)
+old_open_in_lic <- sum(old_open %in% lic_parcels)
+old_open_in_either <- sum(old_open %in% unique(c(viol_parcels, lic_parcels)))
+
+cat("Also have OPEN vacant violation:", comma(old_open_in_viol), 
+    "(", percent(old_open_in_viol / length(old_open), accuracy = 0.1), ")\n")
+cat("Also have Active vacant license:", comma(old_open_in_lic),
+    "(", percent(old_open_in_lic / length(old_open), accuracy = 0.1), ")\n")
+cat("In either violation OR license:", comma(old_open_in_either),
+    "(", percent(old_open_in_either / length(old_open), accuracy = 0.1), ")\n")
+```
+
+```{r cross-validate-closed}
+# Comparison: Old CLOSED cases (created before 2019, case completed)
+old_closed <- cs %>%
+  filter(!is.na(casecompleteddate), year_created < 2019) %>%
+  distinct(opa_account_num) %>% pull(opa_account_num)
+
+cat("\nOld closed CS cases (pre-2019, case completed):", comma(length(old_closed)), "\n")
+
+old_closed_in_either <- sum(old_closed %in% unique(c(viol_parcels, lic_parcels)))
+cat("In either violation OR license:", comma(old_closed_in_either),
+    "(", percent(old_closed_in_either / length(old_closed), accuracy = 0.1), ")\n")
+```
+
+```{r cross-validate-interpret}
+cat("\n--- Interpretation ---\n")
+cat("If old OPEN cases have a higher overlap rate with violations/licenses than\n")
+cat("old CLOSED cases, it confirms that case status is a meaningful signal —\n")
+cat("open cases genuinely track ongoing vacancy better than closed ones.\n")
+```
+
+# 8. Most Recent Investigation Date
+
+`mostrecentinvestigation` tells us when the city last checked on the property. This could be another useful filter.
+
+```{r recent-investigation}
+cs <- cs %>%
+  mutate(investigation_date = as.Date(mostrecentinvestigation))
+
+cat("Records with investigation date:", 
+    comma(sum(!is.na(cs$investigation_date))), 
+    "(", percent(mean(!is.na(cs$investigation_date)), accuracy = 0.1), ")\n")
+
+# Among open cases: when was the last investigation?
+cs %>%
+  filter(is.na(casecompleteddate), !is.na(investigation_date)) %>%
+  mutate(invest_year = year(investigation_date)) %>%
+  count(invest_year) %>%
+  ggplot(aes(x = invest_year, y = n)) +
+  geom_col(fill = "darkgreen") +
+  geom_text(aes(label = comma(n)), vjust = -0.3, size = 3) +
+  labs(title = "Most Recent Investigation Year (Open Cases Only)",
+       subtitle = "Recent investigation = city is still actively monitoring the property",
+       x = "Year", y = "Records") +
+  theme_minimal()
+```
+
+# 9. Summary & Recommendation
+
+```{r summary-table}
+# Build the final comparison: key strategies side by side
+key_strategies <- bind_rows(results_year, results_status, results_hybrid) %>%
+  arrange(desc(Vacancy_rate))
+
+key_strategies %>%
+  mutate(
+    CS_parcels = comma(CS_parcels),
+    Total_OVS1 = comma(Total_OVS1),
+    Vacancy_rate = percent(Vacancy_rate, accuracy = 0.1)
+  ) %>%
+  kable(caption = "All strategies ranked by vacancy rate (descending)") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+```
+
+## Decision Framework
+
+**Factors to consider:**
+
+1. **Vacancy rate plausibility:** Philadelphia's expected vacancy rate is roughly 5-8% based on prior estimates. Strategies yielding <2% are likely too aggressive; >10% may include too many false positives.
+
+2. **Status vs. Year:** Case status is a **direct signal** of whether the issue was resolved. Year cutoff is an **indirect proxy**. Status-based filtering should be preferred when data quality supports it.
+
+3. **CANCELLED work orders:** These represent cases where the boarding-up was never actually performed. Including them adds noise — the building may not be truly sealed/vacant.
+
+4. **Cross-validation evidence:** If Section 7 shows that old open cases have higher overlap with current violations than old closed cases, it confirms status-based filtering captures real vacancy better.
+
+**Recommended next step:** Pick the strategy that yields a vacancy rate closest to the 5-8% expected range, then update `02_ovs_exploration.Rmd` accordingly. Bring this comparison table to the team meeting / Fichman office hours for final decision.
